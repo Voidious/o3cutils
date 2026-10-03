@@ -9,7 +9,7 @@ dependencies = []
 line-length = 88
 
 [tool.pytest.ini_options]
-addopts = "--cov=main --cov-branch --cov-fail-under=100"
+addopts = "--cov=o3cutils --cov=main --cov-branch --cov-fail-under=100"
 pythonpath = ["."]
 
 [tool.coverage.run]
