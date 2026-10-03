@@ -1,28 +1,34 @@
+import os
+
 import pytest
 
 from o3cutils.packets import Cmd, encode_packet
-from o3cutils.transport import CMD_INFO, O3C, TransportError
+from o3cutils.transport import CMD_DISPLAY, CMD_INFO, CMD_SYSINFO, O3C, TransportError
 from o3cutils.transport import connect as transport_connect
 
 
 class FakeDev:
-    """Records written reports and replays canned reads."""
+    """Records written reports and replays canned reads through a pipe."""
 
     def __init__(self, responses=()):
         self.written = []
         self.responses = list(responses)
         self.closed = False
+        self._r, self._w = os.pipe()
+        os.set_blocking(self._w, False)
+
+    def fileno(self):
+        return self._r
 
     def write(self, report):
         self.written.append(bytes(report))
+        if self.responses:
+            os.write(self._w, self.responses.pop(0))
         return len(report)
 
-    def read(self, size):
-        if self.responses:
-            return self.responses.pop(0)
-        return b""
-
     def close(self):
+        os.close(self._r)
+        os.close(self._w)
         self.closed = True
 
 
@@ -47,30 +53,41 @@ class TestSend:
 class TestRead:
     def test_decodes_response(self):
         dev = FakeDev([info_response()])
+        dev.write(info_response())  # feed the pipe
         cmds = O3C(dev).read()
         assert cmds[0].id == CMD_INFO
         assert cmds[0].index == 0
 
-    def test_empty_read_raises(self):
+    def test_empty_read_raises(self, monkeypatch):
+        monkeypatch.setattr("o3cutils.transport.READ_TIMEOUT", 0.01)
         with pytest.raises(TransportError, match="timed out"):
             O3C(FakeDev()).read()
+
+    def test_read_after_device_disconnect_raises(self):
+        dev = FakeDev()
+        os.close(dev._w)  # EOF: selectable but empty
+        with pytest.raises(TransportError, match="timed out"):
+            O3C(dev).read()
 
 
 class TestTransact:
     def test_matches_response_by_id_and_index(self):
         broadcast = encode_packet([Cmd(id=0xFF, index=0, data=b"\xc0\xf0")])
-        dev = FakeDev([broadcast, info_response()])
+        dev = FakeDev([info_response()])
+        os.write(dev._w, broadcast)  # unsolicited broadcast arrives first
         cmd = O3C(dev).transact(CMD_INFO)
         assert cmd.id == CMD_INFO
 
     def test_timeout_raises(self, monkeypatch):
         monkeypatch.setattr("o3cutils.transport.READ_TIMEOUT", 0)
-        dev = FakeDev([info_response(b"\x01")])  # short data, no match needed
+        dev = FakeDev([info_response(b"\x01")])  # wrong id, never matches
         with pytest.raises(TransportError, match="no response"):
             O3C(dev).transact(CMD_SYSINFO)
 
-
-CMD_SYSINFO = 0x02
+    def test_no_response_at_all_raises(self, monkeypatch):
+        monkeypatch.setattr("o3cutils.transport.READ_TIMEOUT", 0.01)
+        with pytest.raises(TransportError, match="no response"):
+            O3C(FakeDev()).transact(CMD_INFO)
 
 
 class TestInfo:
@@ -132,6 +149,58 @@ class TestLifecycle:
         with O3C(dev):
             pass
         assert dev.closed
+
+
+class TestDisplay:
+    def test_reads_chunk_at_offset(self):
+        payload = (0x34).to_bytes(4, "little") + b"\x11" * 52
+        dev = FakeDev([encode_packet([Cmd(id=CMD_DISPLAY, index=0, data=payload)])])
+        chunk = O3C(dev).display(0x34)
+        assert chunk == b"\x11" * 52
+        assert dev.written[0][4:12] == b"\x08\x00\x25\x00" + (0x34).to_bytes(4, "little")
+
+    def test_rejects_bad_offsets(self):
+        o3c = O3C(FakeDev())
+        with pytest.raises(ValueError, match="bad display offset"):
+            o3c.display(-4)
+        with pytest.raises(ValueError, match="bad display offset"):
+            o3c.display(2)
+        with pytest.raises(ValueError, match="bad display offset"):
+            o3c.display(0x10000)
+
+    def test_offset_mismatch_raises(self):
+        payload = (99).to_bytes(4, "little") + b"\x00" * 52
+        dev = FakeDev([encode_packet([Cmd(id=CMD_DISPLAY, index=0, data=payload)])])
+        with pytest.raises(TransportError, match="offset mismatch"):
+            O3C(dev).display(0)
+
+
+def sysinfo_response():
+    data = (
+        b"\x02\x00"  # width
+        b"\x01\x00"  # height
+        b"\x3c\x00\xd7\x07\x00\x00\x00\x00"
+        b"\x89\x80\x09\x00\x01\x05\x00\x00"
+        b"\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x00\x00\x00\x00\x00\x00"
+    )
+    return encode_packet([Cmd(id=CMD_SYSINFO, index=0, data=data)])
+
+
+class TestFramebuffer:
+    def test_dumps_whole_framebuffer(self):
+        # 2x1 screen = 4 bytes; one 52-byte chunk covers it
+        chunk = b"\x11\x22\x33\x44" + b"\x00" * 48
+        responses = [sysinfo_response()]
+        for i, off in enumerate((0,)):
+            responses.append(
+                encode_packet(
+                    [Cmd(id=CMD_DISPLAY, index=0, data=off.to_bytes(4, "little") + chunk)]
+                )
+            )
+        dev = FakeDev(responses)
+        assert O3C(dev).framebuffer() == b"\x11\x22\x33\x44"
 
 
 class TestConnect:

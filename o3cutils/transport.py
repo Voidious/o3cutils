@@ -1,6 +1,7 @@
 """Transport client for talking to an O3C over a hidraw device node."""
 
 import os
+import select
 import time
 
 from .discover import open_first
@@ -11,6 +12,7 @@ REPORT_SIZE = 64
 
 CMD_INFO = 0x00
 CMD_SYSINFO = 0x02
+CMD_DISPLAY = 0x25
 
 
 class TransportError(OSError):
@@ -42,9 +44,16 @@ class O3C:
         self.dev.write(report)
         return index
 
-    def read(self) -> list[Cmd]:
-        """Read one report and return its decoded commands."""
-        buf = self.dev.read(REPORT_SIZE)
+    def read(self, timeout: float | None = None) -> list[Cmd]:
+        """Read one report and return its decoded commands.
+
+        Blocks up to ``timeout`` seconds (default: forever, like hidraw).
+        """
+        timeout = READ_TIMEOUT if timeout is None else timeout
+        readable, _, _ = select.select([self.dev], [], [], timeout)
+        if not readable:
+            raise TransportError("device read timed out")
+        buf = os.read(self.dev.fileno(), REPORT_SIZE)
         if not buf:
             raise TransportError("device read timed out")
         return decode_packet(bytes(buf))
@@ -54,7 +63,11 @@ class O3C:
         index = self.send(cmd_id, data)
         deadline = time.monotonic() + READ_TIMEOUT
         while True:
-            for cmd in self.read():
+            try:
+                cmds = self.read(max(0.01, deadline - time.monotonic()))
+            except TransportError:
+                cmds = []
+            for cmd in cmds:
                 if cmd.id == cmd_id and cmd.index == index:
                     return cmd
             if time.monotonic() >= deadline:
@@ -106,6 +119,31 @@ class O3C:
             "adc_0": u32(0x24),
             "adc_1": u32(0x28),
         }
+
+    def display(self, byte_offset: int) -> bytes:
+        """Read one chunk of the live framebuffer (52 bytes of RGB565).
+
+        Requests without the 4-byte offset wedge the firmware, so the
+        offset is mandatory and validated here.
+        """
+        if not 0 <= byte_offset < 0x10000 or byte_offset % 4:
+            raise ValueError(f"bad display offset: {byte_offset}")
+        res = self.transact(CMD_DISPLAY, byte_offset.to_bytes(4, "little"))
+        got = int.from_bytes(res.data[0:4], "little")
+        if got != byte_offset:
+            raise TransportError(
+                f"display offset mismatch: requested {byte_offset}, got {got}"
+            )
+        return res.data[4:]
+
+    def framebuffer(self) -> bytes:
+        """Dump the whole framebuffer (RGB565, row-major)."""
+        dims = self.sysinfo()
+        size = dims["width"] * dims["height"] * 2
+        out = bytearray()
+        while len(out) < size:
+            out += self.display(len(out))
+        return bytes(out[:size])
 
 
 def connect(path: str | None = None) -> O3C:
