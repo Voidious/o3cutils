@@ -20,9 +20,8 @@ class TransportError(OSError):
 class O3C:
     """Talks to one O3C device over an already-open hidraw file object."""
 
-    def __init__(self, dev, index_seed: int = 0):
+    def __init__(self, dev):
         self.dev = dev
-        self.index = index_seed
 
     def __enter__(self):
         return self
@@ -33,13 +32,12 @@ class O3C:
     def close(self):
         self.dev.close()
 
-    def _next_index(self) -> int:
-        self.index = (self.index + 1) & 0xFF
-        return self.index
+    def send(self, cmd_id: int, data: bytes = b"", index: int = 0) -> int:
+        """Send one command; returns the index used to match its response.
 
-    def send(self, cmd_id: int, data: bytes = b"") -> int:
-        """Send one command; returns the index used to match its response."""
-        index = self._next_index()
+        The device only answers requests with data when ``index`` is 0;
+        nonzero indexes get a bare ack, so 0 is the default.
+        """
         report = encode_packet([Cmd(id=cmd_id, index=index, data=data)])
         self.dev.write(report)
         return index
@@ -65,15 +63,48 @@ class O3C:
                 )
 
     def info(self) -> dict:
-        """Query device info (model code, firmware version, uptime)."""
-        cmd = self.transact(CMD_INFO)
-        raw = cmd.data
+        """Query device info (model code, firmware version, uptime).
+
+        Field offsets verified against live firmware: battery is at 7 and
+        the supported-command list starts at 11 (khang06's gist notes are
+        off by one here).
+        """
+        raw = self.transact(CMD_INFO).data
         return {
             "model_code": int.from_bytes(raw[0:2], "little"),
             "firmware_version": int.from_bytes(raw[2:4], "little"),
-            "battery": raw[8],
-            "fn": raw[9],
-            "uptime": f"{raw[0x0A]}s{raw[0x0B]}ms",
+            "battery": raw[7],
+            "fn": raw[8],
+            "uptime": f"{raw[9]}s{raw[10]}ms",
+            "supported_commands": sorted(set(raw[11:])),
+        }
+
+    def sysinfo(self) -> dict:
+        """Query live system info (display, uptime, clocks)."""
+        raw = self.transact(CMD_SYSINFO).data
+
+        def u16(off):
+            return int.from_bytes(raw[off : off + 2], "little")
+
+        def u32(off):
+            return int.from_bytes(raw[off : off + 4], "little")
+
+        return {
+            "width": u16(0x00),
+            "height": u16(0x02),
+            "refresh_rate": raw[0x04],
+            "sys_ms": u16(0x06),
+            "sys_s": u32(0x08),
+            "vid": u16(0x0C),
+            "pid": u16(0x0E),
+            "cpu_1m": raw[0x10],
+            "cpu_5m": raw[0x11],
+            "cpu_freq": u32(0x14),
+            "hclk": u32(0x18),
+            "pclk_1": u32(0x1C),
+            "pclk_2": u32(0x20),
+            "adc_0": u32(0x24),
+            "adc_1": u32(0x28),
         }
 
 

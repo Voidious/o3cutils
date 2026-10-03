@@ -42,10 +42,16 @@ def v2_checksum(buf: bytes) -> int:
     """Sum ``buf`` as little-endian 16-bit words, as the firmware does."""
     if len(buf) % 2:
         buf = buf + b"\x00"
-    total = 0
-    for i in range(0, len(buf), 2):
-        total += buf[i] | (buf[i + 1] << 8)
-    return total & 0xFFFF
+    return sum(buf[i] | (buf[i + 1] << 8) for i in range(0, len(buf), 2)) & 0xFFFF
+
+
+def packet_checksum(echo: int, body: bytes) -> int:
+    """Checksum of a report: header words (checksum field zeroed) plus cmds.
+
+    Verified against live device responses: the firmware sums the entire
+    report as 16-bit words, with the checksum field itself zeroed.
+    """
+    return (v2_checksum(bytes([REPORT_ID, echo, 0, 0])) + v2_checksum(body)) & 0xFFFF
 
 
 def encode_cmd(cmd: Cmd) -> bytes:
@@ -59,12 +65,17 @@ def encode_cmd(cmd: Cmd) -> bytes:
 
 
 def decode_cmd(buf: bytes, offset: int = 0) -> tuple[Cmd, int]:
-    """Decode one command starting at ``offset``; returns (cmd, next_offset)."""
+    """Decode one command starting at ``offset``; returns (cmd, next_offset).
+
+    The device sets flag bits in the high bits of the length field in some
+    responses (e.g. 0x4000 on bare acks); the low 12 bits are the length.
+    """
     if offset + 2 > len(buf):
         raise PacketError("truncated command length field")
-    length = int.from_bytes(buf[offset : offset + 2], "little")
+    raw = int.from_bytes(buf[offset : offset + 2], "little")
+    length = raw & 0x0FFF
     if length < CMD_HEADER_SIZE or offset + length > len(buf):
-        raise PacketError(f"invalid command length {length}")
+        raise PacketError(f"invalid command length {raw:#06x}")
     cmd = Cmd(
         id=buf[offset + 2],
         index=buf[offset + 3],
@@ -79,7 +90,9 @@ def encode_packet(cmds: list[Cmd]) -> bytes:
     body = b"".join(encode_cmd(c) for c in cmds)
     if len(body) > PACKET_SIZE - 4:
         raise PacketError(f"packet body too large: {len(body)} bytes")
-    header = bytes([REPORT_ID, ECHO]) + v2_checksum(body).to_bytes(2, "little")
+    header = bytes([REPORT_ID, ECHO]) + packet_checksum(ECHO, body).to_bytes(
+        2, "little"
+    )
     return (header + body).ljust(PACKET_SIZE, b"\x00")
 
 
@@ -91,10 +104,9 @@ def decode_packet(buf: bytes) -> list[Cmd]:
         raise PacketError(f"unexpected report id 0x{buf[0]:02x}")
     checksum = int.from_bytes(buf[2:4], "little")
     body = buf[4:]
-    if v2_checksum(body) != checksum:
-        raise PacketError(
-            f"checksum mismatch: got 0x{checksum:04x}, want 0x{v2_checksum(body):04x}"
-        )
+    want = (v2_checksum(buf[:2] + b"\x00\x00") + v2_checksum(body)) & 0xFFFF
+    if want != checksum:
+        raise PacketError(f"checksum mismatch: got 0x{checksum:04x}, want 0x{want:04x}")
     cmds = []
     offset = 0
     while offset < len(body) and body[offset : offset + 2] != b"\x00\x00":

@@ -7,6 +7,7 @@ from o3cutils.packets import (
     decode_packet,
     encode_cmd,
     encode_packet,
+    packet_checksum,
     v2_checksum,
 )
 
@@ -90,7 +91,7 @@ class TestUnpaddedBody:
     def test_decodes_body_with_no_trailing_pad(self):
         cmd = Cmd(0, 1, b"hi")
         body = encode_cmd(cmd)
-        header = bytes([0x21, 0x03]) + v2_checksum(body).to_bytes(2, "little")
+        header = bytes([0x21, 0x03]) + packet_checksum(0x03, body).to_bytes(2, "little")
         assert decode_packet(header + body) == [cmd]
 
     def test_body_too_large_across_cmds(self):
