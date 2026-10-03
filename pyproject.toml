@@ -1,7 +1,7 @@
 [project]
 name = "o3cutils"
 version = "0.1.0"
-description = "Add your description here"
+description = "Python utilities for controlling the SayoDevice O3C macro keyboard's screen and LEDs."
 requires-python = ">=3.12"
 dependencies = []
 
