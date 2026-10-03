@@ -58,6 +58,12 @@ class TestDecodeCmd:
         with pytest.raises(PacketError, match="invalid command length"):
             decode_cmd(b"\x40\x00\x00\x00")
 
+    def test_length_flags_are_stripped(self):
+        # live responses set flag bits above the low-10-bit length
+        cmd, offset = decode_cmd(b"\x04\x4c\x11\x00")
+        assert cmd == Cmd(0x11, 0x00, b"")
+        assert offset == 4
+
 
 class TestPacket:
     def test_roundtrip(self):

@@ -68,12 +68,12 @@ def decode_cmd(buf: bytes, offset: int = 0) -> tuple[Cmd, int]:
     """Decode one command starting at ``offset``; returns (cmd, next_offset).
 
     The device sets flag bits in the high bits of the length field in some
-    responses (e.g. 0x4000 on bare acks); the low 12 bits are the length.
+    responses (e.g. 0x4004 on bare acks); the low 10 bits are the length.
     """
     if offset + 2 > len(buf):
         raise PacketError("truncated command length field")
     raw = int.from_bytes(buf[offset : offset + 2], "little")
-    length = raw & 0x0FFF
+    length = raw & 0x03FF
     if length < CMD_HEADER_SIZE or offset + length > len(buf):
         raise PacketError(f"invalid command length {raw:#06x}")
     cmd = Cmd(
