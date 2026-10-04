@@ -288,6 +288,22 @@ class TestHighSpeed:
         assert dev.written[1][12:1024] == pixels[1012:]
 
 
+class TestClearScreen:
+    def test_blanks_all_layers_both_stacks(self):
+        dev = FakeDev([sysinfo_response()])
+        O3C(dev).clear_screen()
+        assert len(dev.written) == 33  # sysinfo + 32 layer elements
+        cmds = [(w[6], w[7]) for w in dev.written[1:]]  # cmd id, index
+        assert set(cmds) == {
+            (0x22, i) for i in range(16)
+        } | {(0x23, i) for i in range(16)}
+        first = dev.written[1][8:64]  # data begins after hid + v2 header
+        assert first[0:4] == b"\x01\x00\x00\x00"  # etype: rectangle
+        assert first[4:6] == (2).to_bytes(2, "little")  # width from sysinfo
+        assert first[6:8] == (1).to_bytes(2, "little")  # height from sysinfo
+        assert first[12:14] == b"\x00\x00"  # black
+
+
 class TestWriteFramebuffer:
     def test_writes_chunked_reports(self):
         dev = FakeDev()

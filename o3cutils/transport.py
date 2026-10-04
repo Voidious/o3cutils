@@ -23,6 +23,10 @@ CMD_INFO = 0x00
 CMD_SYSINFO = 0x02
 CMD_DISPLAY = 0x25
 CMD_KEY_STATUS = 0x1E
+CMD_SCREEN_MAIN = 0x22
+CMD_SCREEN_SLEEP = 0x23
+
+LAYER_INDEXES = range(16)
 
 
 class TransportError(OSError):
@@ -191,6 +195,25 @@ class O3C:
             chunk = rgb565[pos : pos + self.display_chunk]
             self.send(CMD_DISPLAY, (offset + pos).to_bytes(4, "little") + chunk)
             pos += len(chunk)
+
+    def clear_screen(self) -> None:
+        """Blank the display, including the persistent layer stacks.
+
+        The visible image is a composite of up to 16 element layers on the
+        sleep (0x23) and main (0x22) stacks rendered over the framebuffer,
+        so a black framebuffer write alone leaves layered content visible.
+        This paints a full-screen black element at every index of both
+        stacks. Layer content survives re-attachment; only a power cycle
+        resets it harder than this.
+        """
+        dims = self.sysinfo()
+        element = bytearray(56)
+        element[0:4] = (1).to_bytes(4, "little")  # etype: rectangle
+        element[4:6] = dims["width"].to_bytes(2, "little")
+        element[6:8] = dims["height"].to_bytes(2, "little")
+        for cmd in (CMD_SCREEN_SLEEP, CMD_SCREEN_MAIN):
+            for idx in LAYER_INDEXES:
+                self.send(cmd, bytes(element), index=idx)
 
     def key_status(self) -> int:
         """Return the active-low button/knob bitmask from KeyStatu (0x1E).
