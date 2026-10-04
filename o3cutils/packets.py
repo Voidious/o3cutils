@@ -20,8 +20,10 @@ Packet format (from khang06's O3C reverse-engineering notes):
 from dataclasses import dataclass
 
 REPORT_ID = 0x21
+REPORT_ID_HIGH = 0x22  # 8000 Hz high-speed mode (1024-byte reports)
 ECHO = 0x03
 PACKET_SIZE = 64
+PACKET_SIZE_HIGH = 1024
 CMD_HEADER_SIZE = 4
 
 
@@ -45,19 +47,22 @@ def v2_checksum(buf: bytes) -> int:
     return sum(buf[i] | (buf[i + 1] << 8) for i in range(0, len(buf), 2)) & 0xFFFF
 
 
-def packet_checksum(echo: int, body: bytes) -> int:
+def packet_checksum(echo: int, body: bytes, report_id: int = REPORT_ID) -> int:
     """Checksum of a report: header words (checksum field zeroed) plus cmds.
 
     Verified against live device responses: the firmware sums the entire
-    report as 16-bit words, with the checksum field itself zeroed.
+    report as 16-bit words, with the checksum field itself zeroed. Also
+    verified for 0x22 high-speed reports.
     """
-    return (v2_checksum(bytes([REPORT_ID, echo, 0, 0])) + v2_checksum(body)) & 0xFFFF
+    return (
+        v2_checksum(bytes([report_id, echo, 0, 0])) + v2_checksum(body)
+    ) & 0xFFFF
 
 
-def encode_cmd(cmd: Cmd) -> bytes:
+def encode_cmd(cmd: Cmd, packet_size: int = PACKET_SIZE) -> bytes:
     """Encode one command, padded to a multiple of 4 bytes."""
     length = CMD_HEADER_SIZE + len(cmd.data)
-    if length > PACKET_SIZE:
+    if length > packet_size:
         raise PacketError(f"command too large: {length} bytes")
     out = length.to_bytes(2, "little") + bytes([cmd.id, cmd.index]) + cmd.data
     pad = -len(out) % 4
@@ -85,22 +90,24 @@ def decode_cmd(buf: bytes, offset: int = 0) -> tuple[Cmd, int]:
     return cmd, offset + padded
 
 
-def encode_packet(cmds: list[Cmd]) -> bytes:
-    """Encode a full 64-byte report containing ``cmds``."""
-    body = b"".join(encode_cmd(c) for c in cmds)
-    if len(body) > PACKET_SIZE - 4:
+def encode_packet(
+    cmds: list[Cmd], report_id: int = REPORT_ID, packet_size: int = PACKET_SIZE
+) -> bytes:
+    """Encode a full report containing ``cmds``."""
+    body = b"".join(encode_cmd(c, packet_size) for c in cmds)
+    if len(body) > packet_size - 4:
         raise PacketError(f"packet body too large: {len(body)} bytes")
-    header = bytes([REPORT_ID, ECHO]) + packet_checksum(ECHO, body).to_bytes(
+    header = bytes([report_id, ECHO]) + packet_checksum(ECHO, body, report_id).to_bytes(
         2, "little"
     )
-    return (header + body).ljust(PACKET_SIZE, b"\x00")
+    return (header + body).ljust(packet_size, b"\x00")
 
 
 def decode_packet(buf: bytes) -> list[Cmd]:
     """Decode a report into its commands, verifying report id and checksum."""
     if len(buf) < 4:
         raise PacketError("packet too short")
-    if buf[0] != REPORT_ID:
+    if buf[0] not in (REPORT_ID, REPORT_ID_HIGH):
         raise PacketError(f"unexpected report id 0x{buf[0]:02x}")
     checksum = int.from_bytes(buf[2:4], "little")
     body = buf[4:]

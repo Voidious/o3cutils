@@ -84,13 +84,33 @@ class TestPacket:
 
     def test_wrong_report_id(self):
         with pytest.raises(PacketError, match="report id"):
-            decode_packet(b"\x22\x03\x00\x00" + b"\x00" * 60)
+            decode_packet(b"\x99\x03\x00\x00" + b"\x00" * 60)
 
     def test_checksum_mismatch(self):
         packet = bytearray(encode_packet([Cmd(0, 1, b"hi")]))
         packet[2] ^= 0xFF
         with pytest.raises(PacketError, match="checksum mismatch"):
             decode_packet(bytes(packet))
+
+
+class TestHighSpeedPacket:
+    def test_roundtrip_1024(self):
+        cmds = [Cmd(0x25, 0, b"\x00\x00\x00\x00" + b"\xab" * 1004)]
+        packet = encode_packet(
+            cmds, report_id=0x22, packet_size=1024
+        )
+        assert len(packet) == 1024
+        assert packet[0] == 0x22
+        assert decode_packet(packet) == cmds
+
+    def test_decode_accepts_both_report_ids(self):
+        for rid in (0x21, 0x22):
+            packet = encode_packet([Cmd(0, 1, b"hi")], report_id=rid)
+            assert decode_packet(packet) == [Cmd(0, 1, b"hi")]
+
+    def test_checksum_uses_report_id(self):
+        body = encode_cmd(Cmd(0, 1, b"hi"))
+        assert packet_checksum(3, body, 0x22) != packet_checksum(3, body, 0x21)
 
 
 class TestUnpaddedBody:

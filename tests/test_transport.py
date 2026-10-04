@@ -217,6 +217,76 @@ class TestConnect:
         o3c = transport_connect(str(node))
         o3c.close()
 
+    def test_probe_succeeds_with_high_speed_response(self):
+        from o3cutils.transport import _probe_high_speed
+
+        dev = FakeDev(
+            [
+                encode_packet(
+                    [Cmd(id=CMD_KEY_STATUS, index=0, data=b"\x3f\x00")],
+                    report_id=0x22,
+                    packet_size=1024,
+                )
+            ]
+        )
+        o3c = O3C(dev)
+        assert _probe_high_speed(o3c) is True
+        assert o3c.report_id == 0x22 and o3c.report_size == 1024
+
+    def test_probe_falls_back_to_64_byte(self):
+        from o3cutils.transport import _probe_high_speed
+
+        dev = FakeDev()  # no response at all
+        o3c = O3C(dev)
+        o3c.report_id, o3c.report_size = 0x22, 1024
+        import o3cutils.transport as tr
+
+        orig = tr.READ_TIMEOUT
+        tr.READ_TIMEOUT = 0.01
+        try:
+            assert _probe_high_speed(o3c) is False
+        finally:
+            tr.READ_TIMEOUT = orig
+        assert o3c.report_id == 0x21 and o3c.report_size == 64
+
+    def test_connect_forced_high_speed(self, tmp_path):
+        node = tmp_path / "devnode"
+        node.write_bytes(b"")
+        o3c = transport_connect(str(node), high_speed=True)
+        assert o3c.report_id == 0x22
+        assert o3c.report_size == 1024
+        assert o3c.display_chunk == 1012
+        o3c.close()
+
+    def test_connect_forced_low_speed(self, tmp_path):
+        node = tmp_path / "devnode"
+        node.write_bytes(b"")
+        o3c = transport_connect(str(node), high_speed=False)
+        assert o3c.report_id == 0x21 and o3c.report_size == 64
+        o3c.close()
+
+
+class TestHighSpeed:
+    def test_send_uses_1024_byte_report_id_0x22(self):
+        dev = FakeDev()
+        O3C(dev, high_speed=True).send(0x00)
+        report = dev.written[0]
+        assert len(report) == 1024
+        assert report[0] == 0x22
+
+    def test_write_framebuffer_chunks_1012(self):
+        dev = FakeDev()
+        pixels = b"\xab" * 2024  # two chunks
+        O3C(dev, high_speed=True).write_framebuffer(pixels)
+        assert len(dev.written) == 2
+        assert len(dev.written[0]) == 1024
+        assert dev.written[0][4:12] == (
+            (1020).to_bytes(2, "little") + b"\x25\x00" + b"\x00\x00\x00\x00"
+        )
+        assert dev.written[0][12:1024] == pixels[:1012]
+        assert dev.written[1][8:12] == (1012).to_bytes(4, "little")
+        assert dev.written[1][12:1024] == pixels[1012:]
+
 
 class TestWriteFramebuffer:
     def test_writes_chunked_reports(self):
