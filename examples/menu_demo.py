@@ -79,8 +79,8 @@ ITEM_H = 16  # one menu row
 VISIBLE = (H - TITLE_H) // ITEM_H  # 4 visible items
 
 KEEPALIVE_S = 0.4  # sleep repaint fires ~1.5s after the last display write
-ROTATE_SETTLE_S = 0.025  # knob burst ends after this much quiet
-ROTATE_FLUSH_S = 0.08  # long bursts emit a step this often
+ROTATE_STEP_S = 0.06  # min time between steps while a rotation bit is held
+CLICK_SWALLOW_S = 0.05  # ignore rotation this long after a click edge
 
 
 def rgb565(r, g, b):
@@ -210,11 +210,8 @@ def run(menu_items, title="MENU"):
     picked = None
     try:
         prev = 0x3F
-        click_hold = False  # swallow rotation until the knob settles after a click
-        rotating = False  # a rotation burst is being collected
-        burst_start = 0.0
-        edges = 0  # signed press-edge count for the current burst
-        last_change = time.monotonic()
+        click_hold_until = 0.0  # swallow rotation right after a click edge
+        last_step = 0.0  # last time a rotation step was emitted
         last_ping = 0.0
         while True:
             now = time.monotonic()
@@ -231,45 +228,27 @@ def run(menu_items, title="MENU"):
                 if not on:
                     mask &= ~bit
             if mask != prev:
-                last_change = now
                 newly = prev & ~mask  # bits that just became active
+                released = mask & ~prev  # bits that just went inactive
+                if newly & KNOB_CLICK or released & KNOB_CLICK:
+                    # Clicking wobbles the encoder: swallow rotation around
+                    # both edges of the click.
+                    click_hold_until = now + CLICK_SWALLOW_S
                 if newly & KNOB_CLICK:
-                    # Clicking wobbles the encoder: select now and ignore
-                    # rotation until the knob has settled after release.
                     menu.flash_selected()
                     picked = menu.selected
-                    click_hold = True
-                    rotating = False
-                    edges = 0
-                elif not click_hold:
-                    delta = 0
-                    if newly & KNOB_RIGHT:
-                        delta += 1
-                    if newly & KNOB_LEFT:
-                        delta -= 1
-                    if delta:
-                        if not rotating:
-                            rotating = True
-                            burst_start = now
-                        edges += delta
                 if mask & BUTTON3:
                     break
                 prev = mask
-            if rotating and not click_hold:
-                # One knob detent produces several bouncy/quadrature edges;
-                # collect the burst and move a single step in its net
-                # direction once the knob settles (or every 80ms mid-spin).
-                if now - last_change >= ROTATE_SETTLE_S:
-                    if edges:
-                        menu.move(1 if edges > 0 else -1)
-                    rotating = False
-                    edges = 0
-                elif now - burst_start >= ROTATE_FLUSH_S and edges:
-                    menu.move(1 if edges > 0 else -1)
-                    edges = 0
-                    burst_start = now
-            if click_hold and mask == 0x3F:
-                click_hold = False
+            # Rotation bits are decoded as levels, not edges: a detent may
+            # hold a bit active for several polls (or pulse it once), so
+            # emit at most one step per ROTATE_STEP_S in the held direction.
+            rot_bits = mask & (KNOB_LEFT | KNOB_RIGHT)
+            if not rot_bits or now < click_hold_until:
+                pass
+            elif now - last_step >= ROTATE_STEP_S:
+                menu.move(1 if rot_bits & KNOB_RIGHT else -1)
+                last_step = now
             time.sleep(0.002)
     finally:
         dev.close()
