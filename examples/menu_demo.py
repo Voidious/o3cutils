@@ -260,6 +260,10 @@ def run(menu_items, title="MENU"):
     dev.null_layers()
     menu = Menu(dev, title, menu_items)
     picked = None
+    t0 = time.monotonic()
+    polls = 0
+    raw = -1
+    prev_raw = None
     try:
         knob = KnobDecoder()
         last_ping = 0.0
@@ -270,7 +274,18 @@ def run(menu_items, title="MENU"):
             if now - last_ping >= KEEPALIVE_S:
                 dev.keepalive(bytes(menu.frame.buf[0:2]))
                 last_ping = now
-            state = ButtonState.from_mask(dev.key_status())
+            raw = dev.key_status()
+            polls += 1
+            if raw != prev_raw:
+                print(f"{(now - t0) * 1000:9.1f}ms raw=0x{raw:02x} "
+                      f"polls/s={polls / max(now - t0, 1e-9):.0f}", flush=True)
+                prev_raw = raw
+            if polls % 500 == 0:
+                print(f"{(now - t0) * 1000:9.1f}ms alive polls/s="
+                      f"{polls / max(now - t0, 1e-9):.0f} "
+                      f"sel={menu.selected} lock={knob.rot_lock} "
+                      f"burst={knob.burst_dir}", flush=True)
+            state = ButtonState.from_mask(raw)
             pressed = 0
             for bit, on in ((BUTTON1, state.button1), (BUTTON2, state.button2),
                             (BUTTON3, state.button3), (KNOB_CLICK, state.knob_click),
@@ -278,6 +293,9 @@ def run(menu_items, title="MENU"):
                 if on:
                     pressed |= bit
             step, clicked = knob.feed(pressed, now)
+            if step or clicked:
+                print(f"{(now - t0) * 1000:9.1f}ms event step={step} "
+                      f"click={clicked} sel={menu.selected}", flush=True)
             if clicked:
                 menu.flash_selected()
                 picked = menu.selected
@@ -286,6 +304,13 @@ def run(menu_items, title="MENU"):
             if pressed & BUTTON3:
                 break
             time.sleep(0.002)
+    except BaseException:  # diagnostics: never die silently
+        import traceback
+        traceback.print_exc()
+        print(f"died after {(time.monotonic() - t0):.1f}s, {polls} polls "
+              f"({polls / max(time.monotonic() - t0, 1e-9):.0f}/s), "
+              f"last raw=0x{raw:02x}", flush=True)
+        raise
     finally:
         dev.close()
     return picked
