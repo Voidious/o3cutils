@@ -7,6 +7,9 @@ dirty-row updates so scrolling only repaints what changed.
 
 import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from o3cutils.input import ButtonState
 from o3cutils.transport import connect
