@@ -196,24 +196,38 @@ class O3C:
             self.send(CMD_DISPLAY, (offset + pos).to_bytes(4, "little") + chunk)
             pos += len(chunk)
 
+    def null_layers(
+        self, stacks: tuple[int, ...] = (CMD_SCREEN_SLEEP, CMD_SCREEN_MAIN)
+    ) -> None:
+        """Replace every element on the given layer stacks with Null.
+
+        Element type 0 (Null) renders nothing, so after this the raw
+        framebuffer is the whole visible image. Any non-null element on
+        the main stack composits over the framebuffer within ~1s of a
+        streaming write, blacking it out — so this must run before (and
+        after any prior clear that painted) framebuffer streaming.
+        """
+        for cmd in stacks:
+            for idx in LAYER_INDEXES:
+                self.send(cmd, bytes(56), index=idx)
+
     def clear_screen(self) -> None:
         """Blank the display, including the persistent layer stacks.
 
         The visible image is a composite of up to 16 element layers on the
         sleep (0x23) and main (0x22) stacks rendered over the framebuffer,
         so a black framebuffer write alone leaves layered content visible.
-        This paints a full-screen black element at every index of both
-        stacks. Layer content survives re-attachment; only a power cycle
-        resets it harder than this.
+        This nulls every layer on both stacks (type-0 elements render
+        nothing and let the framebuffer through) and then black-fills the
+        framebuffer. Never paint black *Color* elements to clear: they sit
+        on top of the framebuffer and suppress later streaming writes.
+        Layer content survives re-attachment; only a power cycle resets
+        it harder than this.
         """
+        self.null_layers()
         dims = self.sysinfo()
-        element = bytearray(56)
-        element[0:4] = (1).to_bytes(4, "little")  # etype: rectangle
-        element[4:6] = dims["width"].to_bytes(2, "little")
-        element[6:8] = dims["height"].to_bytes(2, "little")
-        for cmd in (CMD_SCREEN_SLEEP, CMD_SCREEN_MAIN):
-            for idx in LAYER_INDEXES:
-                self.send(cmd, bytes(element), index=idx)
+        black = b"\x00\x00" * (dims["width"] * dims["height"])
+        self.write_framebuffer(black)
 
     def key_status(self) -> int:
         """Return the active-low button/knob bitmask from KeyStatu (0x1E).

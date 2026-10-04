@@ -193,10 +193,14 @@ class Menu:
 
 def run(menu_items, title="MENU"):
     dev = connect()
+    # Streamed frames must own the whole screen: null out every layer
+    # element, or the compositor paints them over the framebuffer.
+    dev.null_layers()
     menu = Menu(dev, title, menu_items)
     picked = None
     try:
         prev = 0x3F
+        click_hold = False
         while True:
             state = ButtonState.from_mask(dev.key_status())
             mask = 0x3F
@@ -206,17 +210,24 @@ def run(menu_items, title="MENU"):
                 if not on:
                     mask &= ~bit
             if mask != prev:
-                if state.knob_right:
-                    menu.move(1)
-                if state.knob_left:
-                    menu.move(-1)
                 if state.knob_click:
+                    # Clicking wobbles the encoder: select now and ignore
+                    # rotation until the knob has settled after release.
                     menu.flash_selected()
                     picked = menu.selected
+                    click_hold = True
+                elif click_hold:
+                    if not (state.knob_left or state.knob_right):
+                        click_hold = False
+                else:
+                    if state.knob_right:
+                        menu.move(1)
+                    if state.knob_left:
+                        menu.move(-1)
                 if state.button3:
                     break
                 prev = mask
-            time.sleep(0.005)
+            time.sleep(0.002)
     finally:
         dev.close()
     return picked

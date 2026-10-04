@@ -288,20 +288,42 @@ class TestHighSpeed:
         assert dev.written[1][12:1024] == pixels[1012:]
 
 
-class TestClearScreen:
-    def test_blanks_all_layers_both_stacks(self):
-        dev = FakeDev([sysinfo_response()])
-        O3C(dev).clear_screen()
-        assert len(dev.written) == 33  # sysinfo + 32 layer elements
-        cmds = [(w[6], w[7]) for w in dev.written[1:]]  # cmd id, index
+class TestNullLayers:
+    def test_nulls_all_layers_both_stacks(self):
+        dev = FakeDev()
+        O3C(dev).null_layers()
+        assert len(dev.written) == 32
+        cmds = [(w[6], w[7]) for w in dev.written]  # cmd id, index
         assert set(cmds) == {
             (0x22, i) for i in range(16)
         } | {(0x23, i) for i in range(16)}
-        first = dev.written[1][8:64]  # data begins after hid + v2 header
-        assert first[0:4] == b"\x01\x00\x00\x00"  # etype: rectangle
-        assert first[4:6] == (2).to_bytes(2, "little")  # width from sysinfo
-        assert first[6:8] == (1).to_bytes(2, "little")  # height from sysinfo
-        assert first[12:14] == b"\x00\x00"  # black
+        for w in dev.written:
+            data = w[8:64]  # data begins after hid + v2 header
+            assert data == bytes(56)  # etype 0 (Null), everything zero
+
+    def test_single_stack(self):
+        dev = FakeDev()
+        O3C(dev).null_layers(stacks=(0x22,))
+        assert {(w[6], w[7]) for w in dev.written} == {
+            (0x22, i) for i in range(16)
+        }
+
+
+class TestClearScreen:
+    def test_nulls_layers_then_blacks_framebuffer(self):
+        dev = FakeDev([sysinfo_response()])
+        O3C(dev).clear_screen()
+        cmds = [(w[6], w[7]) for w in dev.written]
+        # 32 null elements, then sysinfo, then black framebuffer chunks
+        assert set(cmds[:32]) == {
+            (0x22, i) for i in range(16)
+        } | {(0x23, i) for i in range(16)}
+        assert cmds[32][0] == 0x02  # sysinfo
+        assert all(cid == 0x25 for cid, _ in cmds[33:])  # framebuffer writes
+        black = b"".join(w[12:64].rstrip(b"\x00") or b"\x00" for w in dev.written[33:])
+        assert black == b"\x00"  # all-black pixel stream
+        # 2x1 screen from sysinfo_response: one chunk of 2 pixel bytes
+        assert len(dev.written) == 34
 
 
 class TestWriteFramebuffer:
