@@ -81,8 +81,12 @@ ITEM_H = 16  # one menu row
 VISIBLE = (H - TITLE_H) // ITEM_H  # 4 visible items
 
 KEEPALIVE_S = 0.4  # sleep repaint fires ~1.5s after the last display write
-ROT_REPEAT_S = 0.3  # extra step cadence if a burst never goes idle (spin)
-CLICK_DEBOUNCE_S = 0.2  # click wobble can re-assert within ~150ms
+
+
+def _gray(pressed: int) -> int:
+    """Map rotation bits to gray-code position (see KnobDecoder)."""
+    return {0: 0, KNOB_RIGHT: 1, KNOB_RIGHT | KNOB_LEFT: 2,
+            KNOB_LEFT: 3}[pressed & (KNOB_LEFT | KNOB_RIGHT)]
 
 
 def rgb565(r, g, b):
@@ -201,56 +205,83 @@ class Menu:
         f.flush(self.dev)
         time.sleep(0.15)
         self.draw()
+        # Kick: some firmware builds stop presenting streamed framebuffer
+        # updates after knob-click input even though the framebuffer keeps
+        # accepting them (verified by readback). Re-asserting the empty
+        # layer stacks forces a compositor pass, which re-renders the
+        # framebuffer onto the panel.
+        self.dev.null_layers()
+        self.draw(full=True)
 
 
 class KnobDecoder:
     """Turns raw KeyStatu masks into click/select and knob-step events.
 
-    One knob detent shows up as a 3-phase quadrature burst: RIGHT ->
-    LEFT+RIGHT -> LEFT -> idle for one direction, the mirror for the
-    other (see examples/keylog.py). Direction is therefore the FIRST
-    rotation bit of a burst; one step per burst, plus a repeat cadence
-    if a fast spin never returns to idle. Clicking wobbles the encoder
-    for up to ~200ms (a long RIGHT phase rides the release), so after
-    a click all rotation is ignored until knob and click are idle.
+    The knob is a 2-bit gray-code encoder: one detent walks the cycle
+    idle -> RIGHT -> BOTH -> LEFT -> idle (mirrored for the other
+    direction), and contact bounce repeats adjacent states. So rotation
+    is decoded as a quadrature position: adjacent state transitions nudge
+    a counter (bounces cancel themselves out), and every net 4 transitions
+    = one detent = one step. Clicking wobbles the encoder for up to
+    ~200ms (a long RIGHT phase rides the release), so after a click all
+    rotation is ignored until knob and click are fully idle.
     """
 
-    def __init__(self, repeat_s: float = ROT_REPEAT_S):
-        self.repeat_s = repeat_s
-        self.prev = 0
-        self.burst_dir = 0
-        self.burst_start = 0.0
+    # gray-code position of each rotation state: 0=idle, 1=RIGHT only,
+    # 2=BOTH, 3=LEFT only (one direction walks 0,1,2,3,0; mirror = 3,2,1,0)
+    CLICK_DEBOUNCE_S = 0.2  # click wobble can re-assert within ~150ms
+
+    def __init__(self):
+        self.state = 0
+        self.pos = 0
         self.rot_lock = False
         self.last_click = float("-inf")
+        self.idle_since: float | None = None
 
     def feed(self, pressed: int, now: float) -> tuple[int, bool]:
         """Feed one sample (bit set = control active); return (step, clicked)."""
         clicked = False
-        if pressed != self.prev:
-            newly = pressed & ~self.prev
-            if newly & KNOB_CLICK:
+        rot_bits = pressed & (KNOB_LEFT | KNOB_RIGHT)
+        if pressed & KNOB_CLICK:
+            if not self.rot_lock:
                 self.rot_lock = True
-                self.burst_dir = 0
-                if now - self.last_click >= CLICK_DEBOUNCE_S:
+                self.pos = 0
+                if now - self.last_click >= self.CLICK_DEBOUNCE_S:
                     clicked = True
                     self.last_click = now
-            self.prev = pressed
-        rot_bits = pressed & (KNOB_LEFT | KNOB_RIGHT)
+        elif self.rot_lock and not rot_bits:
+            self.rot_lock = False  # release only once knob and click are idle
+            self.state = 0  # resync: the wobble's release edge is not motion
+            self.pos = 0
+            self.idle_since = now
+        rot = _gray(pressed)
         if self.rot_lock:
-            if not rot_bits and not pressed & KNOB_CLICK:
-                self.rot_lock = False
+            self.state = rot  # resync silently while locked
+            self.pos = 0
+            self.idle_since = None
             return 0, clicked
-        if not rot_bits:
-            self.burst_dir = 0
+        step = 0
+        if rot == self.state:
+            if rot == 0 and self.idle_since is not None and now - self.idle_since >= 0.15:
+                self.pos = 0  # partial detent abandoned; drop residue
             return 0, clicked
-        if not self.burst_dir:
-            self.burst_dir = 1 if rot_bits & KNOB_RIGHT else -1
-            self.burst_start = now
-            return self.burst_dir, clicked
-        if now - self.burst_start >= self.repeat_s:
-            self.burst_start = now
-            return self.burst_dir, clicked
-        return 0, clicked
+        if rot == 0:
+            self.idle_since = now
+        else:
+            self.idle_since = None
+        delta = ((rot - self.state + 2) % 4) - 2  # -1/+1 adjacent, else illegal
+        self.state = rot
+        if delta not in (-1, 1):
+            self.pos = 0  # skipped a state mid-spin or glitch: resync
+            return 0, clicked
+        self.pos += delta
+        while self.pos >= 4:
+            self.pos -= 4
+            step += 1
+        while self.pos <= -4:
+            self.pos += 4
+            step -= 1
+        return step, clicked
 
 
 def run(menu_items, title="MENU"):
@@ -284,7 +315,7 @@ def run(menu_items, title="MENU"):
                 print(f"{(now - t0) * 1000:9.1f}ms alive polls/s="
                       f"{polls / max(now - t0, 1e-9):.0f} "
                       f"sel={menu.selected} lock={knob.rot_lock} "
-                      f"burst={knob.burst_dir}", flush=True)
+                      f"pos={knob.pos}", flush=True)
             state = ButtonState.from_mask(raw)
             pressed = 0
             for bit, on in ((BUTTON1, state.button1), (BUTTON2, state.button2),
