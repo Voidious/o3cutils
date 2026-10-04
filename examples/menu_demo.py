@@ -11,7 +11,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from o3cutils.input import ButtonState
+from o3cutils.input import (
+    BUTTON3,
+    KNOB_CLICK,
+    KNOB_LEFT,
+    KNOB_RIGHT,
+    ButtonState,
+)
 from o3cutils.transport import connect
 
 W, H = 160, 80
@@ -71,6 +77,10 @@ YELLOW = 0xFFE0
 TITLE_H = 14  # title bar height
 ITEM_H = 16  # one menu row
 VISIBLE = (H - TITLE_H) // ITEM_H  # 4 visible items
+
+KEEPALIVE_S = 0.4  # sleep repaint fires ~1.5s after the last display write
+ROTATE_SETTLE_S = 0.025  # knob burst ends after this much quiet
+ROTATE_FLUSH_S = 0.08  # long bursts emit a step this often
 
 
 def rgb565(r, g, b):
@@ -200,8 +210,19 @@ def run(menu_items, title="MENU"):
     picked = None
     try:
         prev = 0x3F
-        click_hold = False
+        click_hold = False  # swallow rotation until the knob settles after a click
+        rotating = False  # a rotation burst is being collected
+        burst_start = 0.0
+        edges = 0  # signed press-edge count for the current burst
+        last_change = time.monotonic()
+        last_ping = 0.0
         while True:
+            now = time.monotonic()
+            # Any display write resets the sleep timer; rewrite pixel (0,0)
+            # (title bar) so the keep-alive is invisible.
+            if now - last_ping >= KEEPALIVE_S:
+                dev.keepalive(bytes(menu.frame.buf[0:2]))
+                last_ping = now
             state = ButtonState.from_mask(dev.key_status())
             mask = 0x3F
             for bit, on in ((1, state.button1), (2, state.button2),
@@ -210,23 +231,45 @@ def run(menu_items, title="MENU"):
                 if not on:
                     mask &= ~bit
             if mask != prev:
-                if state.knob_click:
+                last_change = now
+                newly = prev & ~mask  # bits that just became active
+                if newly & KNOB_CLICK:
                     # Clicking wobbles the encoder: select now and ignore
                     # rotation until the knob has settled after release.
                     menu.flash_selected()
                     picked = menu.selected
                     click_hold = True
-                elif click_hold:
-                    if not (state.knob_left or state.knob_right):
-                        click_hold = False
-                else:
-                    if state.knob_right:
-                        menu.move(1)
-                    if state.knob_left:
-                        menu.move(-1)
-                if state.button3:
+                    rotating = False
+                    edges = 0
+                elif not click_hold:
+                    delta = 0
+                    if newly & KNOB_RIGHT:
+                        delta += 1
+                    if newly & KNOB_LEFT:
+                        delta -= 1
+                    if delta:
+                        if not rotating:
+                            rotating = True
+                            burst_start = now
+                        edges += delta
+                if mask & BUTTON3:
                     break
                 prev = mask
+            if rotating and not click_hold:
+                # One knob detent produces several bouncy/quadrature edges;
+                # collect the burst and move a single step in its net
+                # direction once the knob settles (or every 80ms mid-spin).
+                if now - last_change >= ROTATE_SETTLE_S:
+                    if edges:
+                        menu.move(1 if edges > 0 else -1)
+                    rotating = False
+                    edges = 0
+                elif now - burst_start >= ROTATE_FLUSH_S and edges:
+                    menu.move(1 if edges > 0 else -1)
+                    edges = 0
+                    burst_start = now
+            if click_hold and mask == 0x3F:
+                click_hold = False
             time.sleep(0.002)
     finally:
         dev.close()

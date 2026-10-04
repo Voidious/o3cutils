@@ -288,6 +288,23 @@ class TestHighSpeed:
         assert dev.written[1][12:1024] == pixels[1012:]
 
 
+class TestKeepalive:
+    def test_writes_one_pixel_at_offset_zero(self):
+        dev = FakeDev()
+        O3C(dev).keepalive(b"\xab\xcd")
+        assert len(dev.written) == 1
+        assert dev.written[0][8:14] == b"\x00\x00\x00\x00\xab\xcd"
+
+    def test_rejects_bad_pixel_length(self):
+        with pytest.raises(ValueError, match="keepalive"):
+            O3C(FakeDev()).keepalive(b"\x00")
+
+    def test_default_is_two_zero_bytes(self):
+        dev = FakeDev()
+        O3C(dev).keepalive()
+        assert dev.written[0][12:14] == b"\x00\x00"
+
+
 class TestNullLayers:
     def test_nulls_all_layers_both_stacks(self):
         dev = FakeDev()

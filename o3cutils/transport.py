@@ -196,6 +196,19 @@ class O3C:
             self.send(CMD_DISPLAY, (offset + pos).to_bytes(4, "little") + chunk)
             pos += len(chunk)
 
+    def keepalive(self, pixel: bytes = b"\x00\x00") -> None:
+        """Hold the screen awake with a minimal display write.
+
+        The device repaints the framebuffer with the sleep-screen image
+        about 1.5s after the *last* Display write (streaming resets the
+        idle timer; input also wakes it). Writing one pixel every ~0.4s
+        keeps streamed content on screen indefinitely. Pass the pixel
+        bytes already at framebuffer offset 0 to make the write invisible.
+        """
+        if len(pixel) != 2:
+            raise ValueError(f"keepalive needs exactly 2 pixel bytes, got {len(pixel)}")
+        self.send(CMD_DISPLAY, (0).to_bytes(4, "little") + pixel)
+
     def null_layers(
         self, stacks: tuple[int, ...] = (CMD_SCREEN_SLEEP, CMD_SCREEN_MAIN)
     ) -> None:
