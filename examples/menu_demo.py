@@ -12,6 +12,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from o3cutils.input import (
+    BUTTON1,
+    BUTTON2,
     BUTTON3,
     KNOB_CLICK,
     KNOB_LEFT,
@@ -79,8 +81,8 @@ ITEM_H = 16  # one menu row
 VISIBLE = (H - TITLE_H) // ITEM_H  # 4 visible items
 
 KEEPALIVE_S = 0.4  # sleep repaint fires ~1.5s after the last display write
-ROTATE_STEP_S = 0.06  # min time between steps while a rotation bit is held
-CLICK_SWALLOW_S = 0.05  # ignore rotation this long after a click edge
+ROT_REPEAT_S = 0.3  # extra step cadence if a burst never goes idle (spin)
+CLICK_DEBOUNCE_S = 0.2  # click wobble can re-assert within ~150ms
 
 
 def rgb565(r, g, b):
@@ -201,6 +203,56 @@ class Menu:
         self.draw()
 
 
+class KnobDecoder:
+    """Turns raw KeyStatu masks into click/select and knob-step events.
+
+    One knob detent shows up as a 3-phase quadrature burst: RIGHT ->
+    LEFT+RIGHT -> LEFT -> idle for one direction, the mirror for the
+    other (see examples/keylog.py). Direction is therefore the FIRST
+    rotation bit of a burst; one step per burst, plus a repeat cadence
+    if a fast spin never returns to idle. Clicking wobbles the encoder
+    for up to ~200ms (a long RIGHT phase rides the release), so after
+    a click all rotation is ignored until knob and click are idle.
+    """
+
+    def __init__(self, repeat_s: float = ROT_REPEAT_S):
+        self.repeat_s = repeat_s
+        self.prev = 0
+        self.burst_dir = 0
+        self.burst_start = 0.0
+        self.rot_lock = False
+        self.last_click = float("-inf")
+
+    def feed(self, pressed: int, now: float) -> tuple[int, bool]:
+        """Feed one sample (bit set = control active); return (step, clicked)."""
+        clicked = False
+        if pressed != self.prev:
+            newly = pressed & ~self.prev
+            if newly & KNOB_CLICK:
+                self.rot_lock = True
+                self.burst_dir = 0
+                if now - self.last_click >= CLICK_DEBOUNCE_S:
+                    clicked = True
+                    self.last_click = now
+            self.prev = pressed
+        rot_bits = pressed & (KNOB_LEFT | KNOB_RIGHT)
+        if self.rot_lock:
+            if not rot_bits and not pressed & KNOB_CLICK:
+                self.rot_lock = False
+            return 0, clicked
+        if not rot_bits:
+            self.burst_dir = 0
+            return 0, clicked
+        if not self.burst_dir:
+            self.burst_dir = 1 if rot_bits & KNOB_RIGHT else -1
+            self.burst_start = now
+            return self.burst_dir, clicked
+        if now - self.burst_start >= self.repeat_s:
+            self.burst_start = now
+            return self.burst_dir, clicked
+        return 0, clicked
+
+
 def run(menu_items, title="MENU"):
     dev = connect()
     # Streamed frames must own the whole screen: null out every layer
@@ -209,9 +261,7 @@ def run(menu_items, title="MENU"):
     menu = Menu(dev, title, menu_items)
     picked = None
     try:
-        prev = 0x3F
-        click_hold_until = 0.0  # swallow rotation right after a click edge
-        last_step = 0.0  # last time a rotation step was emitted
+        knob = KnobDecoder()
         last_ping = 0.0
         while True:
             now = time.monotonic()
@@ -221,34 +271,20 @@ def run(menu_items, title="MENU"):
                 dev.keepalive(bytes(menu.frame.buf[0:2]))
                 last_ping = now
             state = ButtonState.from_mask(dev.key_status())
-            mask = 0x3F
-            for bit, on in ((1, state.button1), (2, state.button2),
-                            (4, state.button3), (8, state.knob_click),
-                            (16, state.knob_left), (32, state.knob_right)):
-                if not on:
-                    mask &= ~bit
-            if mask != prev:
-                newly = prev & ~mask  # bits that just became active
-                released = mask & ~prev  # bits that just went inactive
-                if newly & KNOB_CLICK or released & KNOB_CLICK:
-                    # Clicking wobbles the encoder: swallow rotation around
-                    # both edges of the click.
-                    click_hold_until = now + CLICK_SWALLOW_S
-                if newly & KNOB_CLICK:
-                    menu.flash_selected()
-                    picked = menu.selected
-                if mask & BUTTON3:
-                    break
-                prev = mask
-            # Rotation bits are decoded as levels, not edges: a detent may
-            # hold a bit active for several polls (or pulse it once), so
-            # emit at most one step per ROTATE_STEP_S in the held direction.
-            rot_bits = mask & (KNOB_LEFT | KNOB_RIGHT)
-            if not rot_bits or now < click_hold_until:
-                pass
-            elif now - last_step >= ROTATE_STEP_S:
-                menu.move(1 if rot_bits & KNOB_RIGHT else -1)
-                last_step = now
+            pressed = 0
+            for bit, on in ((BUTTON1, state.button1), (BUTTON2, state.button2),
+                            (BUTTON3, state.button3), (KNOB_CLICK, state.knob_click),
+                            (KNOB_LEFT, state.knob_left), (KNOB_RIGHT, state.knob_right)):
+                if on:
+                    pressed |= bit
+            step, clicked = knob.feed(pressed, now)
+            if clicked:
+                menu.flash_selected()
+                picked = menu.selected
+            if step:
+                menu.move(step)
+            if pressed & BUTTON3:
+                break
             time.sleep(0.002)
     finally:
         dev.close()
