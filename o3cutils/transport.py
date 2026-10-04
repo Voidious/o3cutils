@@ -5,14 +5,16 @@ import select
 import time
 
 from .discover import open_first
-from .packets import Cmd, decode_packet, encode_packet
+from .packets import Cmd, PacketError, decode_packet, encode_packet
 
 READ_TIMEOUT = 1.0
 REPORT_SIZE = 64
+DISPLAY_CHUNK = 52  # payload bytes per 0x25 chunk (64 - 4 hdr - 4 offset)
 
 CMD_INFO = 0x00
 CMD_SYSINFO = 0x02
 CMD_DISPLAY = 0x25
+CMD_KEY_STATUS = 0x1E
 
 
 class TransportError(OSError):
@@ -65,7 +67,9 @@ class O3C:
         while True:
             try:
                 cmds = self.read(max(0.01, deadline - time.monotonic()))
-            except TransportError:
+            except (TransportError, PacketError):
+                # timeout or an undecodable report (e.g. a mid-stream
+                # broadcast): skip it and keep waiting for the match
                 cmds = []
             for cmd in cmds:
                 if cmd.id == cmd_id and cmd.index == index:
@@ -144,6 +148,32 @@ class O3C:
         while len(out) < size:
             out += self.display(len(out))
         return bytes(out[:size])
+
+    def write_framebuffer(self, rgb565: bytes, offset: int = 0) -> None:
+        """Write raw RGB565 pixels into the framebuffer (streams to screen).
+
+        This is the vendor streaming path: Display (0x25) carries the
+        4-byte byte offset plus up to 52 pixel bytes per report, and each
+        write renders immediately — no refresh command needed.
+        """
+        if len(rgb565) % 2 or not 0 <= offset < 0x10000 or offset % 4:
+            raise ValueError(f"bad framebuffer write: offset={offset}, len={len(rgb565)}")
+        pos = 0
+        while pos < len(rgb565):
+            chunk = rgb565[pos : pos + DISPLAY_CHUNK]
+            self.send(CMD_DISPLAY, (offset + pos).to_bytes(4, "little") + chunk)
+            pos += len(chunk)
+
+    def key_status(self) -> int:
+        """Return the active-low button/knob bitmask from KeyStatu (0x1E).
+
+        Bit clear means pressed: bit 0..2 = buttons 1-3, bit 3 = knob
+        click, bits 4/5 = knob left/right.
+        """
+        res = self.transact(CMD_KEY_STATUS)
+        if not res.data:
+            raise TransportError("empty key status response")
+        return res.data[0]
 
 
 def connect(path: str | None = None) -> O3C:

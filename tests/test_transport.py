@@ -3,7 +3,14 @@ import os
 import pytest
 
 from o3cutils.packets import Cmd, encode_packet
-from o3cutils.transport import CMD_DISPLAY, CMD_INFO, CMD_SYSINFO, O3C, TransportError
+from o3cutils.transport import (
+    CMD_DISPLAY,
+    CMD_INFO,
+    CMD_KEY_STATUS,
+    CMD_SYSINFO,
+    O3C,
+    TransportError,
+)
 from o3cutils.transport import connect as transport_connect
 
 
@@ -209,3 +216,56 @@ class TestConnect:
         node.write_bytes(b"")
         o3c = transport_connect(str(node))
         o3c.close()
+
+
+class TestWriteFramebuffer:
+    def test_writes_chunked_reports(self):
+        dev = FakeDev()
+        pixels = bytes(range(104))  # two chunks
+        O3C(dev).write_framebuffer(pixels)
+        assert len(dev.written) == 2
+        assert dev.written[0][4:12] == b"\x3c\x00\x25\x00" + b"\x00\x00\x00\x00"
+        assert dev.written[0][12:64] == pixels[:52]
+        assert dev.written[1][8:12] == (52).to_bytes(4, "little")
+        assert dev.written[1][12:64] == pixels[52:]
+
+    def test_single_small_write(self):
+        dev = FakeDev()
+        O3C(dev).write_framebuffer(b"\x11\x22", offset=8)
+        assert dev.written[0][8:14] == b"\x08\x00\x00\x00\x11\x22"
+
+    def test_partial_final_chunk(self):
+        dev = FakeDev()
+        pixels = b"\xab" * (52 + 10)
+        O3C(dev).write_framebuffer(pixels)
+        assert len(dev.written) == 2
+        assert dev.written[1][4:6] == b"\x12\x00"
+        assert dev.written[1][12:22] == pixels[52:]
+
+    def test_rejects_bad_args(self):
+        o3c = O3C(FakeDev())
+        with pytest.raises(ValueError, match="bad framebuffer write"):
+            o3c.write_framebuffer(b"\x01")  # odd length
+        with pytest.raises(ValueError, match="bad framebuffer write"):
+            o3c.write_framebuffer(b"\x01\x02", offset=2)  # unaligned
+        with pytest.raises(ValueError, match="bad framebuffer write"):
+            o3c.write_framebuffer(b"\x01\x02", offset=0x10000)
+
+
+class TestKeyStatus:
+    def test_returns_mask(self):
+        dev = FakeDev([encode_packet([Cmd(id=CMD_KEY_STATUS, index=0, data=b"\x3f\x00")])])
+        assert O3C(dev).key_status() == 0x3F
+
+    def test_empty_response_raises(self):
+        dev = FakeDev([encode_packet([Cmd(id=CMD_KEY_STATUS, index=0, data=b"")])])
+        with pytest.raises(TransportError, match="empty key status"):
+            O3C(dev).key_status()
+
+
+class TestTransactSkipsBadPackets:
+    def test_undecodable_report_is_skipped(self):
+        dev = FakeDev([info_response()])
+        os.write(dev._w, b"\xff" * 64)  # garbage report arrives first
+        cmd = O3C(dev).transact(CMD_INFO)
+        assert cmd.id == CMD_INFO
