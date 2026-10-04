@@ -92,6 +92,15 @@ class TestPacket:
         with pytest.raises(PacketError, match="checksum mismatch"):
             decode_packet(bytes(packet))
 
+    def test_high_speed_checksum_mismatch_tolerated(self):
+        # live 8000 Hz firmware sometimes computes the 0x22 checksum
+        # before filling the body; mismatch must not reject the report
+        packet = bytearray(
+            encode_packet([Cmd(0x1E, 0, b"\x3f\x00")], report_id=0x22, packet_size=1024)
+        )
+        packet[2] ^= 0xFF  # corrupt the checksum
+        assert decode_packet(bytes(packet)) == [Cmd(0x1E, 0, b"\x3f\x00")]
+
 
 class TestHighSpeedPacket:
     def test_roundtrip_1024(self):

@@ -104,7 +104,13 @@ def encode_packet(
 
 
 def decode_packet(buf: bytes) -> list[Cmd]:
-    """Decode a report into its commands, verifying report id and checksum."""
+    """Decode a report into its commands, verifying report id and checksum.
+
+    Checksums are enforced strictly for 64-byte 0x21 reports. Live 8000 Hz
+    devices sometimes emit 0x22 responses whose checksum was computed
+    before the body was filled (it equals the header word alone), so for
+    those reports a checksum mismatch is tolerated.
+    """
     if len(buf) < 4:
         raise PacketError("packet too short")
     if buf[0] not in (REPORT_ID, REPORT_ID_HIGH):
@@ -112,7 +118,7 @@ def decode_packet(buf: bytes) -> list[Cmd]:
     checksum = int.from_bytes(buf[2:4], "little")
     body = buf[4:]
     want = (v2_checksum(buf[:2] + b"\x00\x00") + v2_checksum(body)) & 0xFFFF
-    if want != checksum:
+    if want != checksum and len(buf) == PACKET_SIZE:
         raise PacketError(f"checksum mismatch: got 0x{checksum:04x}, want 0x{want:04x}")
     cmds = []
     offset = 0
