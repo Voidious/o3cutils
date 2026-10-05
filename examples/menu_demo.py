@@ -82,6 +82,18 @@ VISIBLE = (H - TITLE_H) // ITEM_H  # 4 visible items
 
 KEEPALIVE_S = 0.4  # sleep repaint fires ~1.5s after the last display write
 
+# Click-freeze handling (see freeze_probe.py findings): a display write
+# racing an active knob click can stop the firmware pushing framebuffer
+# updates to the panel. Avoidance: no writes (flash redraw, keepalive)
+# until the knob has been fully idle for a moment after a click.
+# Safety net: verify the panel push after each click redraw and, if it
+# died, unfreeze with 2s of total write silence (probe-verified fix).
+FLASH_IDLE_S = 0.3  # knob fully quiet this long before the click flash
+FLASH_MAX_WAIT_S = 1.5  # draw the flash anyway after this long
+HEALTH_WINDOW_S = 0.5  # busy-poll window covering the ~30-200ms push lag
+DEAD_STREAK = 2  # consecutive dead click-redraws before recovery
+RECOVERY_SILENCE_S = 2.0  # total write silence that un-freezes the panel
+
 
 def _gray(pressed: int) -> int:
     """Map rotation bits to gray-code position (see KnobDecoder)."""
@@ -204,13 +216,6 @@ class Menu:
         f.text(4, y + 4, self.items[self.selected], BLACK)
         f.flush(self.dev)
         time.sleep(0.15)
-        self.draw()
-        # Kick: some firmware builds stop presenting streamed framebuffer
-        # updates after knob-click input even though the framebuffer keeps
-        # accepting them (verified by readback). Re-asserting the empty
-        # layer stacks forces a compositor pass, which re-renders the
-        # framebuffer onto the panel.
-        self.dev.null_layers()
         self.draw(full=True)
 
 
@@ -295,22 +300,23 @@ def run(menu_items, title="MENU"):
     polls = 0
     raw = -1
     prev_raw = None
+    pending_flash = False
+    pending_since = 0.0
+    last_activity = float("-inf")
+    dead_streak = 0
     try:
         knob = KnobDecoder()
         last_ping = 0.0
         while True:
             now = time.monotonic()
-            # Any display write resets the sleep timer; rewrite pixel (0,0)
-            # (title bar) so the keep-alive is invisible.
-            if now - last_ping >= KEEPALIVE_S:
-                dev.keepalive(bytes(menu.frame.buf[0:2]))
-                last_ping = now
             raw = dev.key_status()
             polls += 1
             if raw != prev_raw:
                 print(f"{(now - t0) * 1000:9.1f}ms raw=0x{raw:02x} "
                       f"polls/s={polls / max(now - t0, 1e-9):.0f}", flush=True)
                 prev_raw = raw
+            if raw not in (0x3F, 0xFF):  # 0xff = push-busy, not input
+                last_activity = now
             if polls % 500 == 0:
                 print(f"{(now - t0) * 1000:9.1f}ms alive polls/s="
                       f"{polls / max(now - t0, 1e-9):.0f} "
@@ -328,10 +334,40 @@ def run(menu_items, title="MENU"):
                 print(f"{(now - t0) * 1000:9.1f}ms event step={step} "
                       f"click={clicked} sel={menu.selected}", flush=True)
             if clicked:
-                menu.flash_selected()
                 picked = menu.selected
+                pending_flash = True
+                pending_since = now
             if step:
                 menu.move(step)
+            if pending_flash and (now - last_activity >= FLASH_IDLE_S
+                                  or now - pending_since >= FLASH_MAX_WAIT_S):
+                pending_flash = False
+                menu.flash_selected()
+                last_ping = now  # the flash redraw counts as a ping
+                if dev.busy_count(HEALTH_WINDOW_S):
+                    dead_streak = 0
+                else:
+                    dead_streak += 1
+                    print(f"{(time.monotonic() - t0) * 1000:9.1f}ms "
+                          f"panel push dead ({dead_streak}/{DEAD_STREAK})",
+                          flush=True)
+                if dead_streak >= DEAD_STREAK:
+                    print(f"{(time.monotonic() - t0) * 1000:9.1f}ms "
+                          f"freeze: {RECOVERY_SILENCE_S:.0f}s write silence "
+                          f"to un-freeze the panel", flush=True)
+                    time.sleep(RECOVERY_SILENCE_S)
+                    menu.draw(full=True)
+                    alive = bool(dev.busy_count(HEALTH_WINDOW_S))
+                    print(f"{(time.monotonic() - t0) * 1000:9.1f}ms "
+                          f"recovery redraw: panel push "
+                          f"{'ALIVE' if alive else 'still dead'}", flush=True)
+                    dead_streak = 0
+                    last_ping = time.monotonic()
+            # Keepalive only while input is quiet: writes racing an
+            # active click are what wedges the panel push.
+            if (not pending_flash and now - last_ping >= KEEPALIVE_S):
+                dev.keepalive(bytes(menu.frame.buf[0:2]))
+                last_ping = now
             if pressed & BUTTON3:
                 break
             time.sleep(0.002)

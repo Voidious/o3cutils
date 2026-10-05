@@ -128,16 +128,22 @@ class Probe:
     _frame: Frame = None
 
 
-def wait_click(probe: Probe, prev_mask: int) -> tuple[int, int]:
+def wait_click(probe: Probe, prev_mask: int,
+               timeout: float | None = None) -> tuple[int, int]:
     """Poll until a knob click fires (or BUTTON3); return (mask, clicks).
+    With ``timeout``, return (prev_mask, 0) if no click arrives in time.
 
     Keeps the screen awake while waiting: pixel (0,0) is black in every
     probe screen, so the keepalive write is invisible."""
     prev_up = True
     last_debounced = float("-inf")
     last_ping = 0.0
+    deadline = None if timeout is None else time.monotonic() + timeout
     while True:
         now = time.monotonic()
+        if deadline is not None and now >= deadline:
+            probe.log("no click within timeout: skipping")
+            return prev_mask, 0
         if now - last_ping >= KEEPALIVE_S:
             probe.dev.keepalive(b"\x00\x00")
             last_ping = now
@@ -238,12 +244,15 @@ def phase_ladder(probe: Probe) -> bool:
 def phase_retest(probe: Probe, f: Frame) -> None:
     """4a: immediate redraws again (expect re-freeze). 4b: redraws
     delayed until knob fully idle (candidate avoidance rule)."""
-    probe.log("PHASE 4a: 4 more immediate-redraw clicks (expect re-freeze)")
+    probe.log("PHASE 4a: 4 more immediate-redraw clicks (expect re-freeze) "
+              "-- CLICK SOME MORE")
     prev_mask = 0x3F
     dead = 0
     for i in range(4):
-        mask, got = wait_click(probe, prev_mask)
+        mask, got = wait_click(probe, prev_mask, timeout=25.0)
         if got < 0:
+            return
+        if got == 0:
             return
         prev_mask = mask
         alive = probe.stream_and_verify(f"4A-{i + 1}", YELLOW)
@@ -251,11 +260,11 @@ def phase_retest(probe: Probe, f: Frame) -> None:
     probe.log(f"PHASE 4a done dead_writes={dead}")
 
     probe.log("PHASE 4b: 6 delayed-redraw clicks (redraw only after the "
-              "knob is fully idle for 0.3s)")
+              "knob is fully idle for 0.3s) -- CLICK SOME MORE")
     dead = 0
     for i in range(6):
-        mask, got = wait_click(probe, prev_mask)
-        if got < 0:
+        mask, got = wait_click(probe, prev_mask, timeout=25.0)
+        if got <= 0:
             return
         prev_mask = mask
         idle_since = None

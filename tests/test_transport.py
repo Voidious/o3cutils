@@ -210,6 +210,27 @@ class TestFramebuffer:
         assert O3C(dev).framebuffer() == b"\x11\x22\x33\x44"
 
 
+def key_response(mask: int):
+    return encode_packet([Cmd(id=CMD_KEY_STATUS, index=0, data=bytes([mask]))])
+
+
+class TestBusyCount:
+    def test_zero_window_polls_nothing(self):
+        dev = FakeDev()
+        assert O3C(dev).busy_count(0.0) == []
+        assert dev.written == []
+
+    def test_counts_busy_replies_with_offsets(self):
+        dev = FakeDev([key_response(0xFF), key_response(0x3F)])
+        hits = O3C(dev).busy_count(0.05)
+        assert len(hits) == 1
+        assert 0.0 <= hits[0] <= 0.05
+
+    def test_no_busy_means_empty(self):
+        dev = FakeDev([key_response(0x3F)])
+        assert O3C(dev).busy_count(0.02) == []
+
+
 class TestConnect:
     def test_connect_opens_path(self, tmp_path):
         node = tmp_path / "devnode"

@@ -253,6 +253,30 @@ class O3C:
             raise TransportError("empty key status response")
         return res.data[0]
 
+    def busy_count(self, window: float) -> list[float]:
+        """Poll KeyStatu for ``window`` seconds; return the offset (in
+        seconds) of every BUSY (0xff) reply.
+
+        The firmware pushes each framebuffer write to the panel a few
+        tens of ms after the write (up to ~200ms right after input
+        activity), replying BUSY to KeyStatu for the few ms the push
+        takes. Hits therefore mean the panel-push path is alive; a
+        full-frame write followed by zero hits over >= 0.5s means the
+        panel has stopped presenting streamed updates (the click
+        freeze). Live-verified: healthy pushes hit at ~30-60ms.
+        """
+        hits = []
+        start = time.monotonic()
+        end = start + window
+        while time.monotonic() < end:
+            try:
+                mask = self.key_status()
+            except TransportError:
+                break
+            if mask == 0xFF:
+                hits.append(time.monotonic() - start)
+        return hits
+
 
 def _probe_high_speed(dev: O3C) -> bool:
     """Try one 1024-byte 0x22 report; True if the device answers it."""
