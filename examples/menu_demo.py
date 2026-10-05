@@ -91,8 +91,10 @@ KEEPALIVE_S = 0.4  # sleep repaint fires ~1.5s after the last display write
 FLASH_IDLE_S = 0.3  # knob fully quiet this long before the click flash
 FLASH_MAX_WAIT_S = 1.5  # draw the flash anyway after this long
 HEALTH_WINDOW_S = 0.5  # busy-poll window covering the ~30-200ms push lag
+BUSY_ECHO_GUARD_S = 0.01  # hits this early are write-burst queue echo, not pushes
 DEAD_STREAK = 2  # consecutive dead click-redraws before recovery
 RECOVERY_SILENCE_S = 2.0  # total write silence that un-freezes the panel
+HOLD_MENU_S = 0.8  # knob held this long opens the firmware's system menu
 
 
 def _gray(pressed: int) -> int:
@@ -304,6 +306,8 @@ def run(menu_items, title="MENU"):
     pending_since = 0.0
     last_activity = float("-inf")
     dead_streak = 0
+    click_since: float | None = None
+    hold_menu = False
     try:
         knob = KnobDecoder()
         last_ping = 0.0
@@ -337,6 +341,25 @@ def run(menu_items, title="MENU"):
                 picked = menu.selected
                 pending_flash = True
                 pending_since = now
+            # A long knob hold opens the firmware's own system menu, which
+            # paints compositor elements over the framebuffer. On release,
+            # null the layers again or every later stream is hidden under
+            # the menu's stale elements (looks like a freeze, but the push
+            # path stays alive).
+            if pressed & KNOB_CLICK:
+                if click_since is None:
+                    click_since = now
+                elif now - click_since >= HOLD_MENU_S and not hold_menu:
+                    hold_menu = True
+            elif click_since is not None:
+                if hold_menu:
+                    hold_menu = False
+                    print(f"{(now - t0) * 1000:9.1f}ms long hold: system menu?"
+                          f" re-nulling layers + redraw", flush=True)
+                    dev.null_layers()
+                    menu.draw(full=True)
+                    last_ping = now
+                click_since = None
             if step:
                 menu.move(step)
             if pending_flash and (now - last_activity >= FLASH_IDLE_S
@@ -344,7 +367,8 @@ def run(menu_items, title="MENU"):
                 pending_flash = False
                 menu.flash_selected()
                 last_ping = now  # the flash redraw counts as a ping
-                if dev.busy_count(HEALTH_WINDOW_S):
+                if any(h >= BUSY_ECHO_GUARD_S
+                       for h in dev.busy_count(HEALTH_WINDOW_S)):
                     dead_streak = 0
                 else:
                     dead_streak += 1
@@ -355,6 +379,7 @@ def run(menu_items, title="MENU"):
                     print(f"{(time.monotonic() - t0) * 1000:9.1f}ms "
                           f"freeze: {RECOVERY_SILENCE_S:.0f}s write silence "
                           f"to un-freeze the panel", flush=True)
+                    dev.null_layers()  # in case layers occlude, not wedged
                     time.sleep(RECOVERY_SILENCE_S)
                     menu.draw(full=True)
                     alive = bool(dev.busy_count(HEALTH_WINDOW_S))
