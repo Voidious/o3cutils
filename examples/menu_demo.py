@@ -82,17 +82,18 @@ VISIBLE = (H - TITLE_H) // ITEM_H  # 4 visible items
 
 KEEPALIVE_S = 0.4  # sleep repaint fires ~1.5s after the last display write
 
-# Click-freeze handling (see freeze_probe.py findings): a display write
-# racing an active knob click can stop the firmware pushing framebuffer
-# updates to the panel. Avoidance: no writes (flash redraw, keepalive)
-# until the knob has been fully idle for a moment after a click.
-# Safety net: verify the panel push after each click redraw and, if it
-# died, unfreeze with 2s of total write silence (probe-verified fix).
-FLASH_IDLE_S = 0.3  # knob fully quiet this long before the click flash
-FLASH_MAX_WAIT_S = 1.5  # draw the flash anyway after this long
+# Freeze handling (see freeze_probe.py findings): a display write racing
+# ACTIVE INPUT (a knob click or rotation) can stop the firmware pushing
+# framebuffer updates to the panel. Scrolling froze for exactly this
+# reason: scroll redraws wrote mid-rotation. Avoidance: no writes at all
+# (scroll/click redraws, keepalives) until the knob has been fully idle
+# for a moment. Safety net: verify the panel push after every redraw and,
+# if it died, unfreeze with 2s of total write silence (probe-verified fix).
+REDRAW_IDLE_S = 0.3  # knob fully quiet this long before any redraw
+REDRAW_MAX_WAIT_S = 1.5  # draw anyway after this long (long continuous spin)
 HEALTH_WINDOW_S = 0.5  # busy-poll window covering the ~30-200ms push lag
 BUSY_ECHO_GUARD_S = 0.01  # hits this early are write-burst queue echo, not pushes
-DEAD_STREAK = 2  # consecutive dead click-redraws before recovery
+DEAD_STREAK = 2  # consecutive dead redraws before recovery
 RECOVERY_SILENCE_S = 2.0  # total write silence that un-freezes the panel
 HOLD_MENU_S = 0.8  # knob held this long opens the firmware's system menu
 
@@ -199,17 +200,12 @@ class Menu:
         f.flush(self.dev)
 
     def move(self, delta):
-        old_sel, old_top = self.selected, self.top
+        """Update selection/top WITHOUT drawing (redraws are deferred until
+        the knob is idle — mid-rotation writes wedge the panel push)."""
         self.selected = max(0, min(len(self.items) - 1, self.selected + delta))
         self.top = min(self.top, self.selected)
         if self.selected >= self.top + VISIBLE:
             self.top = self.selected - VISIBLE + 1
-        if self.selected == old_sel:
-            return
-        if self.top != old_top:
-            self.draw()  # scrolled: everything shifts
-        else:
-            self.draw_rows({old_sel - old_top, self.selected - old_top})
 
     def flash_selected(self):
         f = self.frame
@@ -302,12 +298,13 @@ def run(menu_items, title="MENU"):
     polls = 0
     raw = -1
     prev_raw = None
-    pending_flash = False
+    pending = None  # 'draw' (scroll) or 'flash' (click) deferred until idle
     pending_since = 0.0
     last_activity = float("-inf")
     dead_streak = 0
     click_since: float | None = None
     hold_menu = False
+    renull = False
     try:
         knob = KnobDecoder()
         last_ping = 0.0
@@ -339,7 +336,7 @@ def run(menu_items, title="MENU"):
                       f"click={clicked} sel={menu.selected}", flush=True)
             if clicked:
                 picked = menu.selected
-                pending_flash = True
+                pending = "flash"
                 pending_since = now
             # A long knob hold opens the firmware's own system menu, which
             # paints compositor elements over the framebuffer. On release,
@@ -355,18 +352,32 @@ def run(menu_items, title="MENU"):
                 if hold_menu:
                     hold_menu = False
                     print(f"{(now - t0) * 1000:9.1f}ms long hold: system menu?"
-                          f" re-nulling layers + redraw", flush=True)
-                    dev.null_layers()
-                    menu.draw(full=True)
-                    last_ping = now
+                          f" re-null + redraw deferred until knob idle",
+                          flush=True)
+                    renull = True
+                    pending = "draw"
+                    pending_since = now
                 click_since = None
             if step:
-                menu.move(step)
-            if pending_flash and (now - last_activity >= FLASH_IDLE_S
-                                  or now - pending_since >= FLASH_MAX_WAIT_S):
-                pending_flash = False
-                menu.flash_selected()
-                last_ping = now  # the flash redraw counts as a ping
+                menu.move(step)  # state only; draw deferred until knob idle
+                if pending != "flash":
+                    pending = "draw"
+                    pending_since = now
+            # Any deferred redraw (scroll update or click flash) waits for
+            # the knob to go fully quiet: writes racing active input are
+            # what wedges the panel push.
+            if pending and (now - last_activity >= REDRAW_IDLE_S
+                            or now - pending_since >= REDRAW_MAX_WAIT_S):
+                kind = pending
+                pending = None
+                if renull:
+                    renull = False
+                    dev.null_layers()
+                if kind == "flash":
+                    menu.flash_selected()
+                else:
+                    menu.draw(full=True)
+                last_ping = now  # the redraw counts as a ping
                 if any(h >= BUSY_ECHO_GUARD_S
                        for h in dev.busy_count(HEALTH_WINDOW_S)):
                     dead_streak = 0
@@ -389,8 +400,9 @@ def run(menu_items, title="MENU"):
                     dead_streak = 0
                     last_ping = time.monotonic()
             # Keepalive only while input is quiet: writes racing an
-            # active click are what wedges the panel push.
-            if (not pending_flash and now - last_ping >= KEEPALIVE_S):
+            # active knob are what wedges the panel push.
+            if (pending is None and now - last_ping >= KEEPALIVE_S
+                    and now - last_activity >= REDRAW_IDLE_S):
                 dev.keepalive(bytes(menu.frame.buf[0:2]))
                 last_ping = now
             if pressed & BUTTON3:
