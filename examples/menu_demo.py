@@ -92,7 +92,13 @@ KEEPALIVE_S = 0.4  # sleep repaint fires ~1.5s after the last display write
 REDRAW_IDLE_S = 0.3  # knob fully quiet this long before any redraw
 REDRAW_MAX_WAIT_S = 1.5  # draw anyway after this long (long continuous spin)
 HEALTH_WINDOW_S = 0.5  # busy-poll window covering the ~30-200ms push lag
-BUSY_ECHO_GUARD_S = 0.01  # hits this early are write-burst queue echo, not pushes
+# Push-alive signature (re-measured 2026-11-10, live firmware): any Display
+# write triggers 1-2 BUSY replies within ~1-3ms of the write — at any idle
+# age, full-frame or partial. A wedged push produces ZERO busy replies over
+# the whole window (freeze_probe evidence). So ANY hit means alive; an early
+# hit is NOT queue echo (an earlier 10ms guard misread every redraw as dead,
+# and the resulting spurious 2s-silence recoveries let the sleep repaint
+# blank the screen — looked like a settings change but was not).
 DEAD_STREAK = 2  # consecutive dead redraws before recovery
 RECOVERY_SILENCE_S = 2.0  # total write silence that un-freezes the panel
 HOLD_MENU_S = 0.8  # knob held this long opens the firmware's system menu
@@ -378,8 +384,7 @@ def run(menu_items, title="MENU"):
                 else:
                     menu.draw(full=True)
                 last_ping = now  # the redraw counts as a ping
-                if any(h >= BUSY_ECHO_GUARD_S
-                       for h in dev.busy_count(HEALTH_WINDOW_S)):
+                if dev.busy_count(HEALTH_WINDOW_S):
                     dead_streak = 0
                 else:
                     dead_streak += 1

@@ -257,13 +257,14 @@ class O3C:
         """Poll KeyStatu for ``window`` seconds; return the offset (in
         seconds) of every BUSY (0xff) reply.
 
-        The firmware pushes each framebuffer write to the panel a few
-        tens of ms after the write (up to ~200ms right after input
-        activity), replying BUSY to KeyStatu for the few ms the push
+        The firmware pushes each framebuffer write to the panel within a
+        few ms of the write (live-measured: 1-2 BUSY replies starting
+        ~1-3ms after the write, at any idle age; earlier sessions saw
+        30-60ms lags), replying BUSY to KeyStatu for the few ms the push
         takes. Hits therefore mean the panel-push path is alive; a
         full-frame write followed by zero hits over >= 0.5s means the
         panel has stopped presenting streamed updates (the click
-        freeze). Live-verified: healthy pushes hit at ~30-60ms.
+        freeze).
         """
         hits = []
         start = time.monotonic()
